@@ -1,11 +1,13 @@
-"""AI 사용량 한도 작업표시줄 위젯 (Antigravity · Claude Code · Codex).
+"""AI 사용량 한도 + 시스템 사용량 작업표시줄 위젯.
 
-작업표시줄 위에 도구별 주간 잔량(원형 그래프)과 리셋까지 남은 시간을 표시한다.
+작업표시줄 위에 도구별 주간 잔량(원형 그래프)과 리셋까지 남은 시간, CPU·RAM·GPU 사용량을 표시한다.
+우클릭 → 표시 항목 에서 Antigravity · Claude Code · Codex · CPU · RAM · GPU 를 각각 켜고 끌 수 있다.
 마우스를 0.7초 올려두면 상세 패널, 클릭하면 패널 고정, 드래그로 좌우 이동, 우클릭으로 메뉴.
 바는 작업표시줄이 소유한 창으로 띄워서, 작업표시줄을 클릭해도 가려지거나 깜박이지 않는다.
 """
 import ctypes
 import ctypes.wintypes
+import collections
 import json
 import os
 import threading
@@ -14,6 +16,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 
 import collector
+import sysmon
 
 CONFIG_FILE = os.path.join(collector.CACHE_DIR, "widget.json")
 REFRESH_SEC = 120
@@ -22,6 +25,11 @@ PANEL_W = 400          # 상세 패널 폭 (96dpi 기준)
 CELL_W = 70            # 작업표시줄 칸 폭 (96dpi 기준)
 HOVER_MS = 700         # 상세 패널이 뜨기까지 마우스를 올려둬야 하는 시간
 TRAY_GAP = 6           # 알림 영역(트레이)과의 간격
+SYS_MS = 2000          # CPU·RAM·GPU 갱신 주기
+HIST = 24              # 작업표시줄 미니 그래프에 쓰는 샘플 수
+
+AI_ITEMS = [n for n, _ in collector.SOURCES]
+SYS_ITEMS = ["CPU", "RAM", "GPU"]
 
 C = {
     "bg": "#16171b", "card": "#1f2026", "line": "#2a2b33", "track": "#3a3b45",
@@ -34,6 +42,13 @@ FONT = "Malgun Gothic"
 
 
 # ---------------------------------------------------------------- formatting
+
+def usage_color(pct):
+    """시스템 사용률 색: 높을수록 경고."""
+    if pct is None:
+        return C["muted"]
+    return C["good"] if pct < 60 else C["warn"] if pct < 85 else C["bad"]
+
 
 def level_color(pct):
     if pct is None:
@@ -171,7 +186,13 @@ class App:
         except Exception:
             pass
         self.cfg = self._load_cfg()
-        self.data = [collector.load_cache().get(n) for n, _ in collector.SOURCES]
+        cache = collector.load_cache()
+        self.data = {n: cache.get(n) for n in AI_ITEMS}
+        self.show = {n: n in self.cfg.get("show", AI_ITEMS + SYS_ITEMS) for n in AI_ITEMS + SYS_ITEMS}
+        self.sys = {}                                   # 이름 -> 최신 측정값
+        self.hist = {n: collections.deque(maxlen=HIST) for n in ("CPU", "GPU")}
+        self.cpu = self.gpu = None
+        self.sys_job = None
         self.loading = False
         self.timer = None
         self.pinned = False
@@ -198,6 +219,7 @@ class App:
 
         self.draw_bar()
         self.refresh()
+        self._sys_tick()
         self.root.after(TICK_MS, self._tick)
         self.root.after(3000, self._watch_taskbar)
 
@@ -217,7 +239,7 @@ class App:
     # ------------------------------------------------------------ taskbar bar
     def _build_bar(self):
         self.root.overrideredirect(True)
-        self.bar_w = int(CELL_W * len(collector.SOURCES) * self.s)
+        self.bar_w = self._bar_width()
         self.cv = tk.Canvas(self.root, width=self.bar_w, highlightthickness=0, bd=0, cursor="hand2")
         self.cv.pack()
         self.root.update_idletasks()
@@ -229,6 +251,12 @@ class App:
         self.cv.bind("<B1-Motion>", self._drag)
         self.cv.bind("<ButtonRelease-1>", self._release)
         self.cv.bind("<Button-3>", lambda e: self.menu.tk_popup(*cursor_pos()))
+
+    def items(self):
+        return [n for n in AI_ITEMS + SYS_ITEMS if self.show[n]]
+
+    def _bar_width(self):
+        return int(CELL_W * max(1, len(self.items())) * self.s)
 
     def _attach(self, tb):
         """작업표시줄을 바의 소유자(owner)로 지정한다.
@@ -261,7 +289,7 @@ class App:
             tt, x = sh - tb_h, sw - self.bar_w - int(330 * self.s)
         self.bar_h = tb_h
         self.bar_x, self.bar_y = x, tt
-        self.cv.config(height=tb_h)
+        self.cv.config(width=self.bar_w, height=tb_h)
         if tb:
             self._attach(tb)
         else:
@@ -285,17 +313,22 @@ class App:
         self.root.after(3000, self._watch_taskbar)
 
     def _match_taskbar_color(self):
-        """작업표시줄 색을 바 바로 왼쪽에서 샘플링해 배경으로 쓴다."""
-        px = screen_pixel(max(0, self.bar_x - 3), self.bar_y + self.bar_h // 2)
-        self.bar_bg = px or "#202020"
+        """작업표시줄 색을 여러 지점에서 샘플링해 가장 흔한 색을 배경으로 쓴다 (아이콘 위를 피하려고)."""
+        info = taskbar_info()
+        tl, tr = (info[1][0], info[1][2]) if info else (0, self.root.winfo_screenwidth())
+        y = self.bar_y + self.bar_h // 2
+        xs = [tl + 3, tl + (tr - tl) // 8, tl + (tr - tl) // 5, max(0, self.bar_x - 3), self.bar_x - 40]
+        samples = [c for c in (screen_pixel(x, y) for x in xs if tl <= x < tr) if c]
+        self.bar_bg = max(set(samples), key=samples.count) if samples else "#202020"
         self.cv.config(bg=self.bar_bg)
         self.root.config(bg=self.bar_bg)
         r, g, b = (int(self.bar_bg[i:i + 2], 16) for i in (1, 3, 5))
         self.bar_light = (r * 299 + g * 587 + b * 114) / 1000 > 140   # 밝은 작업표시줄 테마
 
-    def draw_bar(self):
+    def draw_bar(self, only_sys=False):
+        """only_sys=True 면 2초마다 바뀌는 시스템 칸만 다시 그린다 (AI 칸은 그대로)."""
         cv, s = self.cv, self.s
-        cv.delete("all")
+        cv.delete("sys" if only_sys else "all")
         h = self.bar_h
         fg = "#1a1a1a" if self.bar_light else "#f2f2f2"
         sub = "#555555" if self.bar_light else "#a8a8a8"
@@ -304,17 +337,23 @@ class App:
         width = max(2.5, 2.6 * s)
         cy = h / 2
 
-        def ring(cx, dia, pct, wd):
+        def ring(cx, dia, pct, wd, color=level_color, tag="ai"):
             box = (cx - dia / 2, cy - dia / 2, cx + dia / 2, cy + dia / 2)
-            cv.create_oval(*box, outline=track, width=wd)
-            if pct:
+            cv.create_oval(*box, outline=track, width=wd, tags=tag)
+            if pct and pct >= 0.5:      # 각도가 너무 작으면 Tk 가 원 전체를 그린다
                 extent = -359.9 if pct >= 99.95 else -360 * pct / 100
-                cv.create_arc(*box, start=90, extent=extent, style="arc", outline=level_color(pct), width=wd)
+                cv.create_arc(*box, start=90, extent=extent, style="arc", outline=color(pct), width=wd,
+                              tags=tag)
 
         cell = CELL_W * s
-        for i, src in enumerate(self.data):
+        for i, name in enumerate(self.items()):
             x0 = i * cell + 3 * s
-            name = src["name"] if src else ""
+            if name in SYS_ITEMS:
+                self._draw_sys_cell(name, x0, d, width, cy, ring, fg, sub)
+                continue
+            if only_sys:
+                continue
+            src = self.data.get(name)
             font = self.f_ring
             if name == "Antigravity":
                 # 이중 원: 바깥 = Gemini, 안쪽 = Claude·GPT. 숫자·시간은 Gemini 기준
@@ -333,8 +372,32 @@ class App:
                            font=self.f_bar_name)
             cv.create_text(tx, cy + 6 * s, text=fmt_tiny(w["resets_at"]) if w else "–",
                            anchor="w", fill=fg, font=self.f_bar_time)
-        if self.loading:
+        if not only_sys and self.loading and any(self.show[n] for n in AI_ITEMS):
             cv.create_oval(self.bar_w - 5 * s, 3 * s, self.bar_w - 2 * s, 6 * s, fill=C["warn"], outline="")
+
+    def _draw_sys_cell(self, name, x0, d, width, cy, ring, fg, sub):
+        """시스템 칸: 사용률 원 + 이름 + (CPU·GPU 미니 그래프 / RAM 사용량)."""
+        cv, s = self.cv, self.s
+        v = self.sys.get(name)
+        pct = v["pct"] if v else None
+        ring(x0 + d / 2, d, pct, width, usage_color, "sys")
+        cv.create_text(x0 + d / 2, cy, text="–" if pct is None else f"{pct:.0f}", fill=fg, font=self.f_ring, tags="sys")
+        tx = x0 + d + 4 * s
+        cv.create_text(tx, cy - 6 * s, text=name, anchor="w", fill=sub, font=self.f_bar_name, tags="sys")
+        if name == "RAM" and v:
+            cv.create_text(tx, cy + 6 * s, text=f"{v['used']:.1f}/{v['total']:.0f}G", anchor="w",
+                           fill=fg, font=self.f_bar_time, tags="sys")
+        elif name in self.hist and len(self.hist[name]) > 1:
+            gw, gh = (CELL_W - 3) * s - (tx - x0) - 4 * s, 9 * s     # 그래프 영역
+            gy = cy + 6 * s + gh / 2
+            pts = list(self.hist[name])
+            step = gw / (HIST - 1)
+            xs = tx + gw - step * (len(pts) - 1)
+            coords = []
+            for j, val in enumerate(pts):
+                coords += [xs + j * step, gy - gh * val / 100]
+            cv.create_line(tx, gy, tx + gw, gy, fill=sub, width=1, tags="sys")
+            cv.create_line(*coords, fill=usage_color(pct), width=max(1, 1.4 * s), tags="sys")
 
     # bar interaction: 클릭 = 패널 고정, 드래그 = 좌우 이동
     def _press(self, e):
@@ -435,13 +498,16 @@ class App:
         cv = self.pcv
         cv.delete("all")
         pad, y = 14, 12
-        cv.create_text(pad, y + 8, text="AI 사용량 한도", anchor="w", fill=C["text"], font=self.f_title)
+        title = "AI 사용량 한도" if any(self.show[n] for n in AI_ITEMS) else "시스템 사용량"
+        cv.create_text(pad, y + 8, text=title, anchor="w", fill=C["text"], font=self.f_title)
         status = "갱신 중…" if self.loading else ("고정됨 · 클릭하여 닫기" if self.pinned else "클릭하여 고정")
         cv.create_text(PANEL_W - pad, y + 8, text=status, anchor="e", fill=C["muted"], font=self.f_small)
         y += 26
-        for src in self.data:
-            if src:
-                y = self._draw_source(src, y, pad)
+        for name in AI_ITEMS:
+            if self.show[name] and self.data.get(name):
+                y = self._draw_source(self.data[name], y, pad)
+        if any(self.show[n] for n in SYS_ITEMS):
+            y = self._draw_sys_card(y, pad)
         cv.scale("all", 0, 0, self.s, self.s)
         cv.config(height=int((y + 4) * self.s))
 
@@ -487,6 +553,42 @@ class App:
                            anchor="w", fill=col, font=self.f_small)
         return top + h + 8
 
+    def _draw_sys_card(self, y, pad):
+        cv = self.pcv
+        names = [n for n in SYS_ITEMS if self.show[n]]
+        top, inner = y, pad + 12
+        h = 34 + len(names) * 40
+        cv.create_rectangle(pad, top, PANEL_W - pad, top + h, fill=C["card"], outline="")
+        cv.create_rectangle(pad, top, pad + 3, top + h, fill="#7c8a9a", outline="")
+        cv.create_text(inner, top + 16, text="시스템", anchor="w", fill=C["text"], font=self.f_title)
+        cv.create_text(PANEL_W - pad - 12, top + 16, text=f"{SYS_MS // 1000}초마다 갱신", anchor="e",
+                       fill=C["sub"], font=self.f_small)
+        y = top + 34
+        bar_x0, bar_x1, right = inner, PANEL_W - pad - 84, PANEL_W - pad - 12
+        for name in names:
+            v = self.sys.get(name) or {}
+            pct = v.get("pct")
+            if name == "RAM" and v:
+                detail = f"{v['used']:.1f} / {v['total']:.1f} GB"
+            elif name == "GPU" and v:
+                detail = (f"VRAM {v['used']:.1f} / {v['total']:.1f} GB" if v.get("total") and v.get("used")
+                          else "내장 GPU (공유 메모리)")
+            elif name == "GPU" and self.gpu and not self.gpu.ok:
+                detail = "성능 카운터를 읽을 수 없음"
+            else:
+                detail = ""
+            col = usage_color(pct)
+            cv.create_text(inner, y + 8, text=name, anchor="w", fill=C["sub"], font=self.f_body)
+            cv.create_text(right, y + 8, text=detail, anchor="e", fill=C["sub"], font=self.f_small)
+            cv.create_rectangle(bar_x0, y + 20, bar_x1, y + 26, fill=C["track"], outline="")
+            if pct:
+                fx = bar_x0 + (bar_x1 - bar_x0) * pct / 100
+                cv.create_rectangle(bar_x0, y + 20, max(fx, bar_x0 + 2), y + 26, fill=col, outline="")
+            cv.create_text(right, y + 23, text="–" if pct is None else f"{pct:.0f}% 사용", anchor="e",
+                           fill=col, font=self.f_small)
+            y += 40
+        return top + h + 8
+
     def _ellipsize(self, text, max_px):
         f = self.f_body
         max_px *= self.s
@@ -501,10 +603,34 @@ class App:
         m = self.menu = tk.Menu(self.root, tearoff=0)
         m.add_command(label="지금 새로고침", command=self.refresh)
         m.add_command(label="Antigravity 실행해서 조회", command=lambda: self.refresh(force_antigravity=True))
+        sub = tk.Menu(m, tearoff=0)
+        self.show_vars = {}
+        for i, name in enumerate(AI_ITEMS + SYS_ITEMS):
+            if i == len(AI_ITEMS):
+                sub.add_separator()
+            var = self.show_vars[name] = tk.BooleanVar(value=self.show[name])
+            sub.add_checkbutton(label=name, variable=var, command=lambda n=name: self._toggle_item(n))
+        m.add_cascade(label="표시 항목", menu=sub)
         m.add_command(label="상세 패널 고정/해제", command=self._toggle_pin)
         m.add_command(label="위치 초기화", command=self._reset_pos)
         m.add_separator()
         m.add_command(label="종료", command=self.root.destroy)
+
+    def _toggle_item(self, name):
+        on = self.show_vars[name].get()
+        if not on and len(self.items()) == 1:      # 하나는 남겨 둔다
+            self.show_vars[name].set(True)
+            return
+        self.show[name] = on
+        self.cfg["show"] = self.items()
+        self._save_cfg()
+        self.bar_w = self._bar_width()
+        self._place_bar()
+        if on and name in AI_ITEMS:
+            self.refresh()
+        if name in SYS_ITEMS:
+            self._sys_tick()
+        self._redraw()
 
     def _reset_pos(self):
         self.cfg.pop("tray_offset", None)
@@ -514,14 +640,19 @@ class App:
 
     # ------------------------------------------------------------ data
     def refresh(self, force_antigravity=False):
-        if self.loading:
+        enabled = [n for n in AI_ITEMS if self.show[n]]
+        if self.loading or not enabled:            # 꺼진 AI 항목은 조회하지 않는다
+            if not enabled and self.timer:
+                self.root.after_cancel(self.timer)
+                self.timer = None
             return
         self.loading = True
         self._redraw()
 
         def work():
             try:
-                data = collector.collect_all(force_antigravity=force_antigravity)
+                res = collector.collect_all(only=enabled, force_antigravity=force_antigravity)
+                data = {n: r for n, r in zip(AI_ITEMS, res)}
             except Exception:
                 data = self.data
             self.root.after(0, self._on_data, data)
@@ -540,6 +671,32 @@ class App:
         if self.panel.winfo_viewable():
             self.draw_panel()
             self._position_panel()
+
+    def _sys_tick(self):
+        """CPU·RAM·GPU 측정. 하나도 켜져 있지 않으면 멈춘다."""
+        if self.sys_job:
+            self.root.after_cancel(self.sys_job)
+            self.sys_job = None
+        if not any(self.show[n] for n in SYS_ITEMS):
+            return
+        if self.show["CPU"]:
+            self.cpu = self.cpu or sysmon.CPU()
+            pct = self.cpu.read()
+            self.sys["CPU"] = {"pct": pct}
+            self.hist["CPU"].append(pct)
+        if self.show["RAM"]:
+            pct, used, total = sysmon.ram()
+            self.sys["RAM"] = {"pct": pct, "used": used, "total": total}
+        if self.show["GPU"]:
+            self.gpu = self.gpu or sysmon.GPU()
+            pct, used, total = self.gpu.read()
+            if pct is not None:
+                self.sys["GPU"] = {"pct": pct, "used": used, "total": total}
+                self.hist["GPU"].append(pct)
+        self.draw_bar(only_sys=True)
+        if self.panel.winfo_viewable():
+            self.draw_panel()
+        self.sys_job = self.root.after(SYS_MS, self._sys_tick)
 
     def _tick(self):
         self._redraw()
