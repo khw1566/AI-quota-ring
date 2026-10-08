@@ -500,6 +500,7 @@ class App:
     def _build_menu(self):
         m = self.menu = tk.Menu(self.root, tearoff=0)
         m.add_command(label="지금 새로고침", command=self.refresh)
+        m.add_command(label="Antigravity 실행해서 조회", command=lambda: self.refresh(force_antigravity=True))
         m.add_command(label="상세 패널 고정/해제", command=self._toggle_pin)
         m.add_command(label="위치 초기화", command=self._reset_pos)
         m.add_separator()
@@ -512,7 +513,7 @@ class App:
         self.draw_bar()
 
     # ------------------------------------------------------------ data
-    def refresh(self):
+    def refresh(self, force_antigravity=False):
         if self.loading:
             return
         self.loading = True
@@ -520,7 +521,7 @@ class App:
 
         def work():
             try:
-                data = collector.collect_all()
+                data = collector.collect_all(force_antigravity=force_antigravity)
             except Exception:
                 data = self.data
             self.root.after(0, self._on_data, data)

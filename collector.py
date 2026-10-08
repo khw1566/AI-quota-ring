@@ -8,6 +8,7 @@
 }
 """
 import base64
+import ctypes
 import datetime as dt
 import glob
 import json
@@ -260,22 +261,26 @@ def _group_models(models, fetched_at):
 
 
 AG_EXE = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Antigravity IDE", "Antigravity IDE.exe")
-AG_BG_INTERVAL = 30 * 60   # 앱이 꺼져 있을 때 백그라운드 실행으로 재조회하는 최소 간격
+# Antigravity 가 꺼져 있으면 쿼터를 쓸 수 없으므로 마지막 실측값이 그대로 유효하다(리셋 시각이 지나면 100%).
+# 그래서 무거운 IDE 백그라운드 실행은 실측값이 오래됐을 때(주로 PC 시작 직후)나 수동 요청 때만 한다.
+AG_BG_INTERVAL = 6 * 3600
 AG_BG_TIMEOUT = 90
-AG_BG_NOTE = "백그라운드 조회 · 30분마다 갱신"
 
 
-def fetch_antigravity():
+def fetch_antigravity(force_background=False):
     try:
         models, plan = _antigravity_live()
         note = None
     except Exception:
         prev = load_cache().get("Antigravity") or {}
-        if prev.get("live") and time.time() - (prev.get("fetched_at") or 0) < AG_BG_INTERVAL:
-            return dict(prev, note=AG_BG_NOTE)
+        fresh = prev.get("live") and time.time() - (prev.get("fetched_at") or 0) < AG_BG_INTERVAL
+        if fresh and not force_background:
+            seen = time.strftime("%H:%M", time.localtime(prev["fetched_at"]))
+            rows = _group_models(prev["models"], prev["fetched_at"]) if prev.get("models") else prev["windows"]
+            return dict(prev, windows=rows, note=f"Antigravity 꺼짐 · {seen} 실측값 (사용 안 하면 그대로)")
         try:
             models, plan = _antigravity_background()
-            note = AG_BG_NOTE
+            note = "백그라운드 실행으로 조회"
         except Exception as e:
             models, plan, mtime = _antigravity_cached()
             res = _result("Antigravity", _group_models(models, mtime), plan,
@@ -284,23 +289,71 @@ def fetch_antigravity():
             return res
     res = _result("Antigravity", _group_models(models, time.time()), plan, note=note)
     res["live"] = True
+    res["models"] = models   # 꺼진 동안 5시간/주간 구분과 리셋 처리를 다시 계산하기 위해 보관
     return res
 
 
-def _ps_json(script):
-    out = subprocess.run(["powershell", "-NoProfile", "-Command", script + " | ConvertTo-Json -Compress"],
-                         capture_output=True, text=True, timeout=20, creationflags=NO_WINDOW).stdout.strip()
-    if not out:
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [("dwSize", ctypes.c_ulong), ("cntUsage", ctypes.c_ulong), ("th32ProcessID", ctypes.c_ulong),
+                ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", ctypes.c_ulong),
+                ("cntThreads", ctypes.c_ulong), ("th32ParentProcessID", ctypes.c_ulong),
+                ("pcPriClassBase", ctypes.c_long), ("dwFlags", ctypes.c_ulong),
+                ("szExeFile", ctypes.c_wchar * 260)]
+
+
+def _pids(prefix):
+    """이름이 prefix 로 시작하는 프로세스 PID 목록. (외부 프로세스를 띄우지 않는 Toolhelp 스냅샷)"""
+    k32 = ctypes.windll.kernel32
+    k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    snap = k32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+    if not snap or snap == ctypes.c_void_p(-1).value:
         return []
-    v = json.loads(out)
-    return v if isinstance(v, list) else [v]
+    out, e = [], _PROCESSENTRY32W()
+    e.dwSize = ctypes.sizeof(e)
+    try:
+        ok = k32.Process32FirstW(ctypes.c_void_p(snap), ctypes.byref(e))
+        while ok:
+            if e.szExeFile.lower().startswith(prefix.lower()):
+                out.append(e.th32ProcessID)
+            ok = k32.Process32NextW(ctypes.c_void_p(snap), ctypes.byref(e))
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(snap))
+    return out
+
+
+_ls_info = {}   # pid -> (csrf, [ports]) : 언어 서버당 한 번만 조회
+
+
+def _ls_endpoints(pids):
+    """새로 보이는 language_server 의 csrf 토큰과 포트를 한 번만 조회해 캐시한다."""
+    for pid in list(_ls_info):
+        if pid not in pids:
+            del _ls_info[pid]
+    new = [p for p in pids if p not in _ls_info]
+    if new:
+        flt = " or ".join(f"ProcessId={p}" for p in new)
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"Get-CimInstance Win32_Process -Filter '{flt}' | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"],
+            capture_output=True, text=True, timeout=20, creationflags=NO_WINDOW).stdout.strip()
+        procs = json.loads(out) if out else []
+        procs = procs if isinstance(procs, list) else [procs]
+        netstat = subprocess.run(["netstat", "-ano", "-p", "TCP"], capture_output=True, text=True,
+                                 timeout=15, creationflags=NO_WINDOW).stdout
+        for p in procs:
+            m = re.search(r"--csrf_token[= ](\S+)", p.get("CommandLine") or "")
+            pid = p["ProcessId"]
+            ports = re.findall(r"127\.0\.0\.1:(\d+)\s+\S+\s+LISTENING\s+" + str(pid) + r"\b", netstat)
+            if m and ports:   # 포트가 아직 안 열렸으면 캐시하지 않고 다음에 다시 본다
+                _ls_info[pid] = (m.group(1), ports)
+    return [_ls_info[p] for p in pids if p in _ls_info]
 
 
 def _antigravity_background():
     """Antigravity IDE 를 최소화 상태로 잠깐 띄워 쿼터를 조회한 뒤 종료한다."""
     if not os.path.exists(AG_EXE):
         raise FileNotFoundError("Antigravity IDE 설치 경로 없음")
-    if _ps_json("Get-Process -Name 'Antigravity IDE' -ErrorAction SilentlyContinue | Select-Object Id"):
+    if _pids("Antigravity IDE"):
         raise RuntimeError("Antigravity IDE 실행 중이지만 응답 없음")  # 사용자가 켠 창은 건드리지 않는다
     si = subprocess.STARTUPINFO()
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -322,19 +375,10 @@ def _antigravity_background():
 
 def _antigravity_live():
     """실행 중인 language_server 에 GetUserStatus 를 요청한다."""
-    procs = _ps_json("Get-CimInstance Win32_Process -Filter \"Name like 'language_server%'\" | "
-                     "Select-Object ProcessId,CommandLine")
-    if not procs:
+    pids = _pids("language_server")
+    if not pids:
         raise RuntimeError("Antigravity 미실행")
-    netstat = subprocess.run(["netstat", "-ano", "-p", "TCP"], capture_output=True, text=True,
-                             timeout=15, creationflags=NO_WINDOW).stdout
-    for p in procs:
-        cmd = p.get("CommandLine") or ""
-        m = re.search(r"--csrf_token[= ](\S+)", cmd)
-        if not m:
-            continue
-        csrf, pid = m.group(1), str(p["ProcessId"])
-        ports = re.findall(r"127\.0\.0\.1:(\d+)\s+\S+\s+LISTENING\s+" + pid + r"\b", netstat)
+    for csrf, ports in _ls_endpoints(pids):
         for port in ports:
             try:
                 data = _http_json(
@@ -461,13 +505,15 @@ def collect_one(name, fn, cache):
         return res
 
 
-def collect_all(only=None):
+def collect_all(only=None, force_antigravity=False):
     cache = load_cache()
     out = {}
     for name, fn in SOURCES:
         if only and name not in only:
             out[name] = cache.get(name)
             continue
+        if name == "Antigravity" and force_antigravity:
+            fn = lambda: fetch_antigravity(force_background=True)
         out[name] = collect_one(name, fn, cache)
     save_cache(cache)
     return [out[n] for n, _ in SOURCES]
