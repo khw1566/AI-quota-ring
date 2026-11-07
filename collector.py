@@ -7,18 +7,16 @@
   "windows": [{"label": str, "remaining": float|None, "resets_at": float|None, "missing": bool}]
 }
 """
-import base64
 import ctypes
 import datetime as dt
 import glob
 import json
 import os
 import re
-import sqlite3
 import ssl
-import struct
 import subprocess
 import time
+import urllib.error
 import urllib.request
 
 HOME = os.path.expanduser("~")
@@ -31,10 +29,18 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 # ---------------------------------------------------------------- helpers
 
+_ssl = {}   # 매 요청마다 인증서 묶음을 다시 읽지 않도록 컨텍스트를 재사용
+
+
+def _ctx(insecure):
+    if insecure not in _ssl:
+        _ssl[insecure] = ssl._create_unverified_context() if insecure else ssl.create_default_context()
+    return _ssl[insecure]
+
+
 def _http_json(url, headers, data=None, insecure=False):
     req = urllib.request.Request(url, headers=headers, data=data)
-    ctx = ssl._create_unverified_context() if insecure else None
-    with urllib.request.urlopen(req, timeout=TIMEOUT, context=ctx) as r:
+    with urllib.request.urlopen(req, timeout=TIMEOUT, context=_ctx(insecure)) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
@@ -97,7 +103,7 @@ def _claude_refresh(path):
         except Exception as e:
             last = e
     else:
-        raise PermissionError(f"토큰 갱신 실패 ({last}) · 터미널에서 claude 를 한 번 실행하세요")
+        raise PermissionError(f"토큰 갱신 실패 ({last}) · 터미널에서 claude 실행 후 /login")
     # 갱신 사이에 다른 프로세스(CLI)가 파일을 바꿨다면 그쪽 값을 존중한다
     with open(path, encoding="utf-8") as f:
         latest = json.load(f)
@@ -116,19 +122,51 @@ def _claude_refresh(path):
     return oauth
 
 
-def fetch_claude():
-    """~/.claude/.credentials.json 의 OAuth 토큰으로 /api/oauth/usage 조회 (만료 시 자동 갱신)."""
-    path = os.path.join(HOME, ".claude", ".credentials.json")
-    with open(path, encoding="utf-8") as f:
-        oauth = json.load(f)["claudeAiOauth"]
-    plan = (oauth.get("subscriptionType") or "").capitalize() or None
-    if oauth.get("expiresAt", 0) / 1000 < time.time() + 60:
-        oauth = _claude_refresh(path)
-    data = _http_json("https://api.anthropic.com/api/oauth/usage", {
-        "Authorization": "Bearer " + oauth["accessToken"],
+CLAUDE_LOGIN_HINT = "Claude 로그인 토큰 없음 · 터미널에서 claude 실행 후 /login"
+
+
+def _expiry(ms_or_s):
+    """expiresAt 을 epoch 초로. 밀리초/초 어느 쪽이든 받고, 0·없음이면 None(알 수 없음)."""
+    v = ms_or_s or 0
+    if v <= 0:
+        return None
+    return v / 1000 if v > 1e11 else v
+
+
+def _claude_usage(token):
+    return _http_json("https://api.anthropic.com/api/oauth/usage", {
+        "Authorization": "Bearer " + token,
         "anthropic-beta": "oauth-2025-04-20",
         "User-Agent": "ai-token-widget",
     })
+
+
+def fetch_claude():
+    """~/.claude/.credentials.json 의 OAuth 토큰으로 /api/oauth/usage 조회 (만료·401 시 갱신 후 재시도).
+
+    최근 Claude 업데이트 후 로그아웃·재설치 등으로 이 파일의 토큰이 빈 값으로 남는 경우가 있다.
+    그때는 네트워크 요청 없이 바로 재로그인 안내를 낸다(빈 토큰으로 갱신하면 400 만 돌아온다).
+    """
+    cfg_dir = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
+    path = os.path.join(cfg_dir, ".credentials.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            oauth = json.load(f).get("claudeAiOauth") or {}
+    except FileNotFoundError:
+        raise PermissionError(CLAUDE_LOGIN_HINT) from None
+    plan = (oauth.get("subscriptionType") or "").capitalize() or None
+    access, refresh = oauth.get("accessToken"), oauth.get("refreshToken")
+    if not access and not refresh:
+        raise PermissionError(CLAUDE_LOGIN_HINT)
+    exp = _expiry(oauth.get("expiresAt"))
+    if refresh and (not access or (exp is not None and exp < time.time() + 60)):
+        oauth = _claude_refresh(path)
+    try:
+        data = _claude_usage(oauth["accessToken"])
+    except urllib.error.HTTPError as e:
+        if e.code != 401 or not oauth.get("refreshToken"):
+            raise
+        data = _claude_usage(_claude_refresh(path)["accessToken"])   # 만료 시각이 틀린 경우
     windows = []
     for key, label in (("five_hour", "5시간"), ("seven_day", "주간")):
         w = data.get(key)
@@ -324,26 +362,64 @@ def _pids(prefix):
 _ls_info = {}   # pid -> (csrf, [ports]) : 언어 서버당 한 번만 조회
 
 
+class _USTR(ctypes.Structure):
+    _fields_ = [("Length", ctypes.c_ushort), ("MaximumLength", ctypes.c_ushort), ("Buffer", ctypes.c_void_p)]
+
+
+def _cmdline(pid):
+    """다른 프로세스의 명령줄 (NtQueryInformationProcess / ProcessCommandLineInformation, Win8.1+)."""
+    k32, nt = ctypes.windll.kernel32, ctypes.windll.ntdll
+    k32.OpenProcess.restype = ctypes.c_void_p
+    nt.NtQueryInformationProcess.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+                                             ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)]
+    h = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return ""
+    try:
+        size = ctypes.c_ulong(0)
+        nt.NtQueryInformationProcess(h, 60, None, 0, ctypes.byref(size))
+        if not size.value:
+            return ""
+        buf = ctypes.create_string_buffer(size.value)
+        if nt.NtQueryInformationProcess(h, 60, buf, size, ctypes.byref(size)) != 0:
+            return ""
+        us = _USTR.from_buffer(buf)
+        return ctypes.wstring_at(us.Buffer, us.Length // 2) if us.Buffer else ""
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(h))
+
+
+def _listen_ports():
+    """{pid: [포트]} — 루프백/전체 주소에서 LISTEN 중인 TCP 포트 (GetExtendedTcpTable)."""
+    ip = ctypes.windll.iphlpapi
+    size = ctypes.c_ulong(0)
+    ip.GetExtendedTcpTable(None, ctypes.byref(size), False, 2, 3, 0)   # AF_INET, OWNER_PID_LISTENER
+    buf = ctypes.create_string_buffer(size.value + 1024)
+    size.value = len(buf)
+    if ip.GetExtendedTcpTable(buf, ctypes.byref(size), False, 2, 3, 0) != 0:
+        return {}
+    n = ctypes.c_ulong.from_buffer(buf).value
+    rows = (ctypes.c_ulong * (n * 6)).from_buffer(buf, 4)   # state, laddr, lport, raddr, rport, pid
+    out = {}
+    for i in range(n):
+        addr, port, pid = rows[i * 6 + 1], rows[i * 6 + 2], rows[i * 6 + 5]
+        if addr in (0x0100007F, 0):                          # 127.0.0.1, 0.0.0.0
+            out.setdefault(pid, []).append(str(((port & 0xFF) << 8) | ((port >> 8) & 0xFF)))
+    return out
+
+
 def _ls_endpoints(pids):
-    """새로 보이는 language_server 의 csrf 토큰과 포트를 한 번만 조회해 캐시한다."""
+    """새로 보이는 language_server 의 csrf 토큰과 포트를 한 번만 조회해 캐시한다.
+    (외부 프로세스 없이 Win32 API 만 사용 — 예전 PowerShell·netstat 호출 대체)"""
     for pid in list(_ls_info):
         if pid not in pids:
             del _ls_info[pid]
     new = [p for p in pids if p not in _ls_info]
     if new:
-        flt = " or ".join(f"ProcessId={p}" for p in new)
-        out = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             f"Get-CimInstance Win32_Process -Filter '{flt}' | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"],
-            capture_output=True, text=True, timeout=20, creationflags=NO_WINDOW).stdout.strip()
-        procs = json.loads(out) if out else []
-        procs = procs if isinstance(procs, list) else [procs]
-        netstat = subprocess.run(["netstat", "-ano", "-p", "TCP"], capture_output=True, text=True,
-                                 timeout=15, creationflags=NO_WINDOW).stdout
-        for p in procs:
-            m = re.search(r"--csrf_token[= ](\S+)", p.get("CommandLine") or "")
-            pid = p["ProcessId"]
-            ports = re.findall(r"127\.0\.0\.1:(\d+)\s+\S+\s+LISTENING\s+" + str(pid) + r"\b", netstat)
+        listening = _listen_ports()
+        for pid in new:
+            m = re.search(r"--csrf_token[= ](\S+)", _cmdline(pid))
+            ports = listening.get(pid)
             if m and ports:   # 포트가 아직 안 열렸으면 캐시하지 않고 다음에 다시 본다
                 _ls_info[pid] = (m.group(1), ports)
     return [_ls_info[p] for p in pids if p in _ls_info]
@@ -407,6 +483,9 @@ def _antigravity_live():
 
 
 # 최소한의 protobuf 디코더 (state.vscdb 캐시용)
+import struct as _struct
+
+
 def _varint(b, i):
     r = s = 0
     while True:
@@ -426,10 +505,10 @@ def _pb(b):
         if t == 0:
             v, i = _varint(b, i)
         elif t == 1:
-            v = struct.unpack("<d", b[i:i + 8])[0]
+            v = _struct.unpack("<d", b[i:i + 8])[0]
             i += 8
         elif t == 5:
-            v = struct.unpack("<f", b[i:i + 4])[0]
+            v = _struct.unpack("<f", b[i:i + 4])[0]
             i += 4
         elif t == 2:
             n, i = _varint(b, i)
@@ -450,6 +529,7 @@ def _pb_get(fields, num, default=None):
 
 def _antigravity_cached():
     """Antigravity 가 마지막으로 저장한 userStatus(state.vscdb)를 읽는다."""
+    import base64, sqlite3   # 드물게 쓰는 경로라 필요할 때만 불러온다
     candidates = [os.path.join(APPDATA, d, "User", "globalStorage", "state.vscdb")
                   for d in ("Antigravity IDE", "Antigravity")]
     candidates = [c for c in candidates if os.path.exists(c)]

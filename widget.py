@@ -78,7 +78,7 @@ def fmt_tiny(ts):
         return "–"
     secs = ts - time.time()
     if secs <= 0:
-        return "리셋"
+        return "reset"   # 작업표시줄 글꼴(Segoe UI 소형)은 한글이 깨져 보여 영문으로
     d, h, m = _dhm(secs)
     return f"{d}d {h}h" if d else f"{h}h {m}m" if h else f"{max(m, 1)}m"
 
@@ -100,7 +100,14 @@ def fmt_ago(ts):
         return "방금"
     if s < 3600:
         return f"{int(s // 60)}분 전"
-    return f"{int(s // 3600)}시간 전"
+    if s < 86400:
+        return f"{int(s // 3600)}시간 전"
+    return f"{int(s // 86400)}일 전"
+
+
+def is_stale(src):
+    """조회에 실패해 이전 값을 보여주는 중인지."""
+    return bool(src) and not src.get("ok", True)
 
 
 def antigravity_groups(src):
@@ -168,6 +175,15 @@ def set_owner(hwnd, owner):
     return fn(hwnd, GWLP_HWNDPARENT, owner)
 
 
+def round_corners(hwnd):
+    """Win11 의 둥근 창 모서리 (DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND). Win10 에선 무시된다."""
+    try:
+        v = ctypes.c_int(2)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(ctypes.c_void_p(hwnd), 33, ctypes.byref(v), 4)
+    except Exception:
+        pass
+
+
 def screen_pixel(x, y):
     hdc = ctypes.windll.user32.GetDC(0)
     c = ctypes.windll.gdi32.GetPixel(hdc, x, y)
@@ -194,6 +210,7 @@ class App:
         self.cpu = self.gpu = None
         self.sys_job = None
         self.loading = False
+        self.last_refresh = None
         self.timer = None
         self.pinned = False
         self.hide_job = None
@@ -354,24 +371,31 @@ class App:
             if only_sys:
                 continue
             src = self.data.get(name)
+            stale = is_stale(src)       # 조회 실패 → 이전 값을 흐리게 + 경고 점
+            col = (lambda p: track) if stale else level_color
             font = self.f_ring
             if name == "Antigravity":
                 # 이중 원: 바깥 = Gemini, 안쪽 = Claude·GPT. 숫자·시간은 Gemini 기준
                 w, other = antigravity_groups(src)
                 thin = max(2, 2.0 * s)
-                ring(x0 + d / 2, d, w and w["remaining"], thin)
-                ring(x0 + d / 2, d - 2 * thin - 2 * s, other and other["remaining"], thin)
+                ring(x0 + d / 2, d, w and w["remaining"], thin, col)
+                ring(x0 + d / 2, d - 2 * thin - 2 * s, other and other["remaining"], thin, col)
                 font = self.f_ring_small
             else:
                 w = weekly_window(src)
-                ring(x0 + d / 2, d, w and w["remaining"], width)
+                ring(x0 + d / 2, d, w and w["remaining"], width, col)
             pct = w["remaining"] if w else None
-            cv.create_text(x0 + d / 2, cy, text="–" if pct is None else f"{pct:.0f}", fill=fg, font=font)
+            cv.create_text(x0 + d / 2, cy, text="–" if pct is None else f"{pct:.0f}",
+                           fill=sub if stale else fg, font=font)
+            if stale:
+                r = 2.5 * s
+                cv.create_oval(x0 + d - r, cy - d / 2 - r * .4, x0 + d + r, cy - d / 2 + r * 1.6,
+                               fill=C["warn"], outline=self.bar_bg)
             tx = x0 + d + 4 * s
             cv.create_text(tx, cy - 6 * s, text=SHORT.get(name, name or "–"), anchor="w", fill=sub,
                            font=self.f_bar_name)
             cv.create_text(tx, cy + 6 * s, text=fmt_tiny(w["resets_at"]) if w else "–",
-                           anchor="w", fill=fg, font=self.f_bar_time)
+                           anchor="w", fill=sub if stale else fg, font=self.f_bar_time)
         if not only_sys and self.loading and any(self.show[n] for n in AI_ITEMS):
             cv.create_oval(self.bar_w - 5 * s, 3 * s, self.bar_w - 2 * s, 6 * s, fill=C["warn"], outline="")
 
@@ -441,6 +465,8 @@ class App:
         self.pcv = tk.Canvas(p, width=int(PANEL_W * self.s), height=100, bg=C["bg"],
                              highlightthickness=1, highlightbackground=C["line"], bd=0)
         self.pcv.pack()
+        p.update_idletasks()
+        round_corners(int(p.wm_frame(), 16))
         self.pcv.bind("<Enter>", lambda e: self._cancel_hide())
         self.pcv.bind("<Leave>", lambda e: self._hover_out())
         self.pcv.bind("<Button-1>", lambda e: self._toggle_pin())
@@ -501,6 +527,8 @@ class App:
         title = "AI 사용량 한도" if any(self.show[n] for n in AI_ITEMS) else "시스템 사용량"
         cv.create_text(pad, y + 8, text=title, anchor="w", fill=C["text"], font=self.f_title)
         status = "갱신 중…" if self.loading else ("고정됨 · 클릭하여 닫기" if self.pinned else "클릭하여 고정")
+        if not self.loading and self.last_refresh:
+            status = time.strftime("%H:%M 갱신 · ", time.localtime(self.last_refresh)) + status
         cv.create_text(PANEL_W - pad, y + 8, text=status, anchor="e", fill=C["muted"], font=self.f_small)
         y += 26
         for name in AI_ITEMS:
@@ -515,9 +543,17 @@ class App:
         cv = self.pcv
         top, inner, name = y, pad + 12, src["name"]
         rows = src["windows"] or []
-        h = 34 + max(len(rows), 1) * 40 + (16 if src.get("note") else 0)
+        stale = is_stale(src)
+        note_w = PANEL_W - inner - pad - 12
+        note = src.get("note")
+        note_lines = 0
+        if note:   # 해결 방법이 잘리지 않도록 두 줄까지 줄바꿈
+            note = self._ellipsize(note, note_w * 2 - 20, self.f_small)
+            note_lines = 1 if self.f_small.measure(note) <= note_w * self.s else 2
+        h = 34 + max(len(rows), 1) * 40 + note_lines * 15 + (2 if note else 0)
         cv.create_rectangle(pad, top, PANEL_W - pad, top + h, fill=C["card"], outline="")
-        cv.create_rectangle(pad, top, pad + 3, top + h, fill=BRAND.get(name, C["sub"]), outline="")
+        cv.create_rectangle(pad, top, pad + 3, top + h, fill=C["warn"] if stale else BRAND.get(name, C["sub"]),
+                            outline="")
         cv.create_text(inner, top + 16, text=name, anchor="w", fill=C["text"], font=self.f_title)
         meta = [m for m in (src.get("plan"), fmt_ago(src["fetched_at"]) if src.get("fetched_at") else None) if m]
         cv.create_text(PANEL_W - pad - 12, top + 16, text=" · ".join(meta), anchor="e",
@@ -536,7 +572,7 @@ class App:
                 y += 40
                 continue
             pct = w["remaining"]
-            col = level_color(pct)
+            col = C["muted"] if stale else level_color(pct)
             cv.create_text(inner, y + 8, text=self._ellipsize(w["label"], 190), anchor="w",
                            fill=C["sub"], font=self.f_body)
             cv.create_text(right, y + 8, text=fmt_left(w["resets_at"], w.get("estimated")), anchor="e",
@@ -547,10 +583,9 @@ class App:
                 cv.create_rectangle(bar_x0, y + 20, max(fx, bar_x0 + 2), y + 26, fill=col, outline="")
             cv.create_text(right, y + 23, text=f"{pct:.0f}% 남음", anchor="e", fill=col, font=self.f_small)
             y += 40
-        if src.get("note"):
-            col = C["warn"] if not src.get("ok", True) else C["muted"]
-            cv.create_text(inner, y + 2, text=self._ellipsize(src["note"], PANEL_W - inner - pad - 12),
-                           anchor="w", fill=col, font=self.f_small)
+        if note:
+            cv.create_text(inner, y - 4, text=note, anchor="nw", width=note_w * self.s,
+                           fill=C["warn"] if stale else C["muted"], font=self.f_small)
         return top + h + 8
 
     def _draw_sys_card(self, y, pad):
@@ -589,8 +624,8 @@ class App:
             y += 40
         return top + h + 8
 
-    def _ellipsize(self, text, max_px):
-        f = self.f_body
+    def _ellipsize(self, text, max_px, font=None):
+        f = font or self.f_body
         max_px *= self.s
         if f.measure(text) <= max_px:
             return text
@@ -661,6 +696,7 @@ class App:
 
     def _on_data(self, data):
         self.data, self.loading = data, False
+        self.last_refresh = time.time()
         self._redraw()
         if self.timer:
             self.root.after_cancel(self.timer)
