@@ -637,7 +637,7 @@ class App:
     def _build_menu(self):
         m = self.menu = tk.Menu(self.root, tearoff=0)
         m.add_command(label="지금 새로고침", command=self.refresh)
-        m.add_command(label="Antigravity 실행해서 조회", command=lambda: self.refresh(force_antigravity=True))
+        m.add_command(label="Antigravity 지금 조회 (안 되면 IDE 실행)", command=lambda: self.refresh(force_antigravity=True))
         sub = tk.Menu(m, tearoff=0)
         self.show_vars = {}
         for i, name in enumerate(AI_ITEMS + SYS_ITEMS):

@@ -299,10 +299,15 @@ def _group_models(models, fetched_at):
 
 
 AG_EXE = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Antigravity IDE", "Antigravity IDE.exe")
+# Antigravity CLI(agy) 는 언어 서버를 띄운 뒤 접속 정보(포트·csrf)를 이 폴더의 hub_<port>.json 에 기록한다.
+AGY_HUB_DIR = os.path.join(HOME, ".gemini", "antigravity", "daemon")
+AGY_EXE_CANDIDATES = [os.path.join(HOME, ".gemini", "bin", "agy.exe"),
+                      os.path.join(HOME, ".local", "bin", "agy.exe")]
 # Antigravity 가 꺼져 있으면 쿼터를 쓸 수 없으므로 마지막 실측값이 그대로 유효하다(리셋 시각이 지나면 100%).
-# 그래서 무거운 IDE 백그라운드 실행은 실측값이 오래됐을 때(주로 PC 시작 직후)나 수동 요청 때만 한다.
-AG_BG_INTERVAL = 6 * 3600
-AG_BG_TIMEOUT = 90
+# 그래서 백그라운드 조회는 실측값이 오래됐을 때(주로 PC 시작 직후)나 수동 요청 때만 한다.
+AG_BG_INTERVAL = 3 * 3600
+AG_BG_TIMEOUT = 60       # 창 없는 agy 실행 대기
+AG_IDE_TIMEOUT = 90      # IDE 실행 대기 (메뉴에서 직접 요청할 때만)
 
 
 def fetch_antigravity(force_background=False):
@@ -317,14 +322,25 @@ def fetch_antigravity(force_background=False):
             rows = _group_models(prev["models"], prev["fetched_at"]) if prev.get("models") else prev["windows"]
             return dict(prev, windows=rows, note=f"Antigravity 꺼짐 · {seen} 실측값 (사용 안 하면 그대로)")
         try:
-            models, plan = _antigravity_background()
-            note = "백그라운드 실행으로 조회"
-        except Exception as e:
-            models, plan, mtime = _antigravity_cached()
-            res = _result("Antigravity", _group_models(models, mtime), plan,
-                          note=f"앱이 마지막으로 저장한 값 ({e})")
-            res["fetched_at"] = mtime
-            return res
+            # 창이 전혀 뜨지 않는 Antigravity CLI(agy) 를 숨김 콘솔로 잠깐 실행해 조회한다.
+            models, plan = _antigravity_agy()
+            note = "백그라운드(창 없음)로 조회"
+        except Exception as e_agy:
+            err = e_agy
+            models = None
+            if force_background:
+                # IDE 실행은 화면에 창이 잠깐 보일 수 있어서, 메뉴에서 직접 요청할 때만 쓴다.
+                try:
+                    models, plan = _antigravity_background()
+                    note = "Antigravity IDE 실행으로 조회"
+                except Exception as e_ide:
+                    err = e_ide
+            if models is None:
+                models, plan, mtime = _antigravity_cached()
+                res = _result("Antigravity", _group_models(models, mtime), plan,
+                              note=f"앱이 마지막으로 저장한 값 ({err})")
+                res["fetched_at"] = mtime
+                return res
     res = _result("Antigravity", _group_models(models, time.time()), plan, note=note)
     res["live"] = True
     res["models"] = models   # 꺼진 동안 5시간/주간 구분과 리셋 처리를 다시 계산하기 위해 보관
@@ -356,6 +372,36 @@ def _pids(prefix):
             ok = k32.Process32NextW(ctypes.c_void_p(snap), ctypes.byref(e))
     finally:
         k32.CloseHandle(ctypes.c_void_p(snap))
+    return out
+
+
+def _pid_alive(pid):
+    k32 = ctypes.windll.kernel32
+    k32.OpenProcess.restype = ctypes.c_void_p
+    h = k32.OpenProcess(0x1000, False, int(pid))   # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    try:
+        code = ctypes.c_ulong(0)
+        return bool(k32.GetExitCodeProcess(ctypes.c_void_p(h), ctypes.byref(code))) and code.value == 259  # STILL_ACTIVE
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(h))
+
+
+def _hub_endpoints(newer_than=0):
+    """agy 가 남긴 hub_*.json 중 프로세스가 살아 있는 것의 (csrf, [https 포트], http 포트)."""
+    out = []
+    for path in glob.glob(os.path.join(AGY_HUB_DIR, "hub_*.json")):
+        try:
+            if os.path.getmtime(path) < newer_than:
+                continue
+            with open(path, encoding="utf-8") as f:
+                h = json.load(f)
+            if h.get("csrfToken") and h.get("pid") and _pid_alive(h["pid"]):
+                ports = [str(h["httpsPort"])] if h.get("httpsPort") else []
+                out.append((h["csrfToken"], ports, h.get("httpPort")))
+        except Exception:
+            continue
     return out
 
 
@@ -425,8 +471,47 @@ def _ls_endpoints(pids):
     return [_ls_info[p] for p in pids if p in _ls_info]
 
 
+def _agy_exe():
+    for p in AGY_EXE_CANDIDATES:
+        if os.path.exists(p):
+            return p
+    import shutil
+    return shutil.which("agy")
+
+
+def _kill_tree(pid):
+    subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)], capture_output=True, creationflags=NO_WINDOW)
+
+
+def _antigravity_agy():
+    """Antigravity CLI(agy) 를 창 없는 콘솔에서 잠깐 실행해 언어 서버에 쿼터를 조회한 뒤 종료한다.
+    agy 는 터미널 프로그램이라 CREATE_NO_WINDOW 로 띄우면 화면에 아무 창도 생기지 않는다.
+    대화를 시작하지 않으므로 쿼터를 쓰지 않는다."""
+    exe = _agy_exe()
+    if not exe:
+        raise FileNotFoundError("Antigravity CLI(agy) 없음")
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    started = time.time() - 1
+    proc = subprocess.Popen([exe], cwd=CACHE_DIR, creationflags=NO_WINDOW)
+    try:
+        deadline = time.time() + AG_BG_TIMEOUT
+        while time.time() < deadline:
+            time.sleep(2)
+            if proc.poll() is not None:
+                raise RuntimeError(f"agy 가 바로 종료됨 (코드 {proc.returncode})")
+            eps = _hub_endpoints(newer_than=started)
+            if eps:
+                try:
+                    return _query_endpoints(eps)
+                except Exception:
+                    pass   # 로그인·모델 목록을 아직 불러오는 중일 수 있다
+        raise TimeoutError("agy 백그라운드 조회 시간 초과")
+    finally:
+        _kill_tree(proc.pid)
+
+
 def _antigravity_background():
-    """Antigravity IDE 를 최소화 상태로 잠깐 띄워 쿼터를 조회한 뒤 종료한다."""
+    """Antigravity IDE 를 최소화 상태로 잠깐 띄워 쿼터를 조회한 뒤 종료한다. (메뉴에서 직접 요청할 때만)"""
     if not os.path.exists(AG_EXE):
         raise FileNotFoundError("Antigravity IDE 설치 경로 없음")
     if _pids("Antigravity IDE"):
@@ -436,7 +521,7 @@ def _antigravity_background():
     si.wShowWindow = 7  # SW_SHOWMINNOACTIVE: 최소화 + 포커스 뺏지 않음
     proc = subprocess.Popen([AG_EXE], startupinfo=si)
     try:
-        deadline = time.time() + AG_BG_TIMEOUT
+        deadline = time.time() + AG_IDE_TIMEOUT
         while time.time() < deadline:
             time.sleep(4)
             try:
@@ -445,25 +530,34 @@ def _antigravity_background():
                 pass
         raise TimeoutError("백그라운드 조회 시간 초과")
     finally:
-        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True,
-                       creationflags=NO_WINDOW)
+        _kill_tree(proc.pid)
 
 
 def _antigravity_live():
-    """실행 중인 language_server 에 GetUserStatus 를 요청한다."""
+    """이미 실행 중인 언어 서버(Antigravity IDE 또는 agy CLI)에 GetUserStatus 를 요청한다."""
+    eps = _hub_endpoints()
     pids = _pids("language_server")
-    if not pids:
+    if pids:
+        eps += [(csrf, ports, None) for csrf, ports in _ls_endpoints(pids)]
+    if not eps:
         raise RuntimeError("Antigravity 미실행")
-    for csrf, ports in _ls_endpoints(pids):
-        for port in ports:
+    return _query_endpoints(eps)
+
+
+def _query_endpoints(eps):
+    body = json.dumps({"metadata": {"ideName": "antigravity", "extensionName": "antigravity",
+                                    "locale": "en"}}).encode()
+    for csrf, ports, http_port in eps:
+        urls = [f"https://127.0.0.1:{p}" for p in ports]
+        if http_port:
+            urls.append(f"http://127.0.0.1:{http_port}")
+        for base in urls:
             try:
                 data = _http_json(
-                    f"https://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/GetUserStatus",
+                    base + "/exa.language_server_pb.LanguageServerService/GetUserStatus",
                     {"Content-Type": "application/json", "Connect-Protocol-Version": "1",
                      "X-Codeium-Csrf-Token": csrf},
-                    data=json.dumps({"metadata": {"ideName": "antigravity", "extensionName": "antigravity",
-                                                  "locale": "en"}}).encode(),
-                    insecure=True)
+                    data=body, insecure=True)
             except Exception:
                 continue
             us = data.get("userStatus") or {}
